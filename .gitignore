@@ -1,0 +1,18 @@
+# macOS junk
+.DS_Store
+
+# Python caches and bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Excel temp/lockfiles and backups
+~$*.xlsx
+*_backup_*.xlsx
+
+# Local-only working file — proprietary, not for GitHub
+NGX_Stock_Screener_Dashboard.xlsx
+
+# Editor / IDE
+.vscode/
+.idea/
