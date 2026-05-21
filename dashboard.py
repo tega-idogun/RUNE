@@ -13,9 +13,6 @@ Setup (one time):
 Run:
     cd ~/Desktop/NGX_Dashboard
     python3 -m streamlit run dashboard.py
-
-Stop:
-    Press Ctrl+C in the Terminal window
 """
 
 import sqlite3
@@ -28,21 +25,12 @@ import streamlit as st
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 DB_PATH = Path(__file__).resolve().parent / "ngx.db"
 
-# Map every instrument code in the `rates` table to a position on the curve (years).
 TENOR_YEARS = {
-    "NTB_91D":  0.25,
-    "NTB_182D": 0.50,
-    "NTB_364D": 1.00,
-    "FGN_2Y":   2,
-    "FGN_3Y":   3,
-    "FGN_5Y":   5,
-    "FGN_7Y":   7,
-    "FGN_10Y":  10,
-    "FGN_15Y":  15,
-    "FGN_20Y":  20,
-    "FGN_30Y":  30,
-    "10Y":      10,
-    "USD10Y":   10,
+    "NTB_91D":  0.25, "NTB_182D": 0.50, "NTB_364D": 1.00,
+    "FGN_2Y":   2,    "FGN_3Y":   3,    "FGN_5Y":   5,
+    "FGN_7Y":   7,    "FGN_10Y":  10,   "FGN_15Y":  15,
+    "FGN_20Y":  20,   "FGN_30Y":  30,
+    "10Y":      10,   "USD10Y":   10,
 }
 
 TENOR_LABEL = {
@@ -60,7 +48,6 @@ FGN_INSTRUMENTS = ["FGN_2Y", "FGN_3Y", "FGN_5Y", "FGN_7Y",
 # ── DATA HELPERS ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60)
 def query(sql: str, params: tuple = ()) -> pd.DataFrame:
-    """Run a SQL query against ngx.db and return a DataFrame."""
     if not DB_PATH.exists():
         return pd.DataFrame()
     conn = sqlite3.connect(DB_PATH)
@@ -71,7 +58,7 @@ def query(sql: str, params: tuple = ()) -> pd.DataFrame:
     return df
 
 
-def latest_snapshot_date() -> str | None:
+def latest_snapshot_date():
     df = query("SELECT MAX(snapshot_date) AS d FROM rates")
     if df.empty or df.iloc[0]["d"] is None:
         return None
@@ -103,36 +90,22 @@ def format_pct(x, decimals=2):
     return f"{x*100:.{decimals}f}%"
 
 
-def render_centered_table(df: pd.DataFrame, height: int | None = None) -> None:
-    """Render a DataFrame with all cell contents and headers centered.
-    Uses HTML injection because Streamlit's st.dataframe does not center text reliably."""
-    html = df.to_html(index=False, escape=False, classes="rune-centered")
-    css = """
-    <style>
-    .rune-centered { width: 100%; border-collapse: collapse; font-size: 14px; }
-    .rune-centered th, .rune-centered td {
-        text-align: center !important; padding: 8px 10px;
-        border-bottom: 1px solid rgba(128, 128, 128, 0.15);
-    }
-    .rune-centered th {
-        font-weight: 600;
-        background-color: rgba(128, 128, 128, 0.08);
-        border-bottom: 2px solid rgba(128, 128, 128, 0.3);
-    }
-    .rune-centered tr:hover td {
-        background-color: rgba(128, 128, 128, 0.04);
-    }
-    </style>
-    """
-    st.markdown(css + html, unsafe_allow_html=True)
+def render_centered_table(df: pd.DataFrame, height=None) -> None:
+    """Render a DataFrame using Streamlit's native renderer with all cells centered.
+    Uses pandas Styler — reliable across Streamlit versions, respects dark/light mode."""
+    styled = (
+        df.style
+          .set_properties(**{"text-align": "center"})
+          .set_table_styles([
+              {"selector": "th", "props": [("text-align", "center"), ("font-weight", "600")]},
+              {"selector": "td", "props": [("text-align", "center")]},
+          ])
+    )
+    st.dataframe(styled, width="stretch", hide_index=True, height=height)
 
 
 # ── PAGE SETUP ────────────────────────────────────────────────────────────────
-st.set_page_config(
-    page_title="Rune",
-    page_icon="🇳🇬",
-    layout="wide",
-)
+st.set_page_config(page_title="Rune", page_icon="🇳🇬", layout="wide")
 
 st.title("Rune")
 st.markdown("_Nigerian fixed income & rates intelligence_")
@@ -146,7 +119,6 @@ else:
     )
     st.stop()
 
-# Sidebar
 with st.sidebar:
     st.header("Database")
     st.write(f"**Path:** `{DB_PATH.name}`")
@@ -208,7 +180,7 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2  —  COMBINED YIELD CURVE (overview)
+# SECTION 2  —  COMBINED YIELD CURVE
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("📈 Sovereign Yield Curve — Overview")
 st.caption("Today's stop rates plotted across the full curve, 91 days to 30 years")
@@ -235,7 +207,7 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3  —  NTB YIELD CURVE (segregated)
+# SECTION 3  —  NTB YIELD CURVE
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("🟦 NTB Yield Curve — Treasury Bills")
 st.caption("Stop rates on 91-day, 182-day, and 364-day Nigerian Treasury Bills")
@@ -267,7 +239,7 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4  —  FGN BOND YIELD CURVE (segregated)
+# SECTION 4  —  FGN BOND YIELD CURVE
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("🟫 FGN Bond Yield Curve — 2-Year through 30-Year")
 st.caption("Stop rates and traded yields across the FGN sovereign bond curve")
@@ -299,12 +271,15 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5  —  REAL YIELD BY TENOR (yield minus inflation)
+# SECTION 5  —  REAL YIELD BY TENOR
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("💹 Real Yield by Tenor")
 cpi = curr.get("CPI")
 if cpi is not None:
-    st.caption(f"Nominal yield minus CPI inflation ({cpi*100:.2f}%). Positive = beating inflation. Negative = losing purchasing power.")
+    st.caption(
+        f"Nominal yield minus CPI inflation ({cpi*100:.2f}%). "
+        "Positive = beating inflation. Negative = losing purchasing power."
+    )
     real_rows = []
     for instr in NTB_INSTRUMENTS + FGN_INSTRUMENTS:
         if instr in curr:
@@ -363,7 +338,7 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 7  —  EUROBONDS (with chart)
+# SECTION 7  —  EUROBONDS
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("🌍 FGN Eurobonds — Latest Snapshot")
 
@@ -381,16 +356,13 @@ if eu_date:
     if ust10y is not None:
         eu["Spread_bps"] = ((eu["yield_pct"] - ust10y) * 10000).round(0)
 
-    # Chart: Eurobond yields with UST 10Y reference line baked into label
     if not eu.empty and ust10y is not None:
         st.markdown(f"**Eurobond yields vs UST 10Y baseline ({ust10y*100:.2f}%)**")
         chart_eu = eu[["bond_name", "yield_pct"]].copy()
         chart_eu["Yield %"] = chart_eu["yield_pct"] * 100
-        # Shorten bond names for readability
         chart_eu["Bond"] = chart_eu["bond_name"].str.replace(r" \(US\$\)", "", regex=True).str.slice(0, 22)
         st.bar_chart(chart_eu.set_index("Bond")[["Yield %"]], height=280)
 
-    # Centered table of all Eurobonds
     st.markdown("**Eurobond detail**")
     eu_display = pd.DataFrame({
         "Bond":          eu["bond_name"].str.replace(r" \(US\$\)", "", regex=True),
@@ -408,7 +380,7 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 8  —  RECENT AUCTIONS (centered)
+# SECTION 8  —  RECENT AUCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("🏛 Recent Auctions — NTBs and FGN Bonds")
 
@@ -437,7 +409,6 @@ if not auct.empty:
 else:
     st.info("No auction records in database yet.")
 
-# Footer
 st.divider()
 st.caption(
     f"**Rune** · Decoding Nigerian markets · "
