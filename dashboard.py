@@ -101,7 +101,11 @@ def render_centered_table(df: pd.DataFrame, height=None) -> None:
               {"selector": "td", "props": [("text-align", "center")]},
           ])
     )
-    st.dataframe(styled, width="stretch", hide_index=True, height=height)
+    # Build kwargs conditionally — newer Streamlit rejects height=None
+    kwargs = {"width": "stretch", "hide_index": True}
+    if height is not None:
+        kwargs["height"] = height
+    st.dataframe(styled, **kwargs)
 
 
 # ── PAGE SETUP ────────────────────────────────────────────────────────────────
