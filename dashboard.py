@@ -26,8 +26,6 @@ import pandas as pd
 import streamlit as st
 
 # ── CONFIG ────────────────────────────────────────────────────────────────────
-# DB sits next to this script — works both locally on your Mac and on
-# Streamlit Cloud (where the repo is mounted at a different path).
 DB_PATH = Path(__file__).resolve().parent / "ngx.db"
 
 # Map every instrument code in the `rates` table to a position on the curve (years).
@@ -54,6 +52,11 @@ TENOR_LABEL = {
     "FGN_20Y":  "20Y",  "FGN_30Y":  "30Y",
 }
 
+NTB_INSTRUMENTS = ["NTB_91D", "NTB_182D", "NTB_364D"]
+FGN_INSTRUMENTS = ["FGN_2Y", "FGN_3Y", "FGN_5Y", "FGN_7Y",
+                   "FGN_10Y", "FGN_15Y", "FGN_20Y", "FGN_30Y"]
+
+
 # ── DATA HELPERS ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60)
 def query(sql: str, params: tuple = ()) -> pd.DataFrame:
@@ -76,7 +79,6 @@ def latest_snapshot_date() -> str | None:
 
 
 def latest_rates() -> dict:
-    """Return {instrument: rate} for the most recent snapshot."""
     d = latest_snapshot_date()
     if not d:
         return {}
@@ -85,7 +87,6 @@ def latest_rates() -> dict:
 
 
 def prior_rates() -> dict:
-    """Return {instrument: rate} for the second-most-recent snapshot."""
     df = query(
         "SELECT DISTINCT snapshot_date FROM rates ORDER BY snapshot_date DESC LIMIT 2"
     )
@@ -97,10 +98,33 @@ def prior_rates() -> dict:
 
 
 def format_pct(x, decimals=2):
-    """Render 0.1595 → '15.95%'. Returns '—' for None/NaN."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         return "—"
     return f"{x*100:.{decimals}f}%"
+
+
+def render_centered_table(df: pd.DataFrame, height: int | None = None) -> None:
+    """Render a DataFrame with all cell contents and headers centered.
+    Uses HTML injection because Streamlit's st.dataframe does not center text reliably."""
+    html = df.to_html(index=False, escape=False, classes="rune-centered")
+    css = """
+    <style>
+    .rune-centered { width: 100%; border-collapse: collapse; font-size: 14px; }
+    .rune-centered th, .rune-centered td {
+        text-align: center !important; padding: 8px 10px;
+        border-bottom: 1px solid rgba(128, 128, 128, 0.15);
+    }
+    .rune-centered th {
+        font-weight: 600;
+        background-color: rgba(128, 128, 128, 0.08);
+        border-bottom: 2px solid rgba(128, 128, 128, 0.3);
+    }
+    .rune-centered tr:hover td {
+        background-color: rgba(128, 128, 128, 0.04);
+    }
+    </style>
+    """
+    st.markdown(css + html, unsafe_allow_html=True)
 
 
 # ── PAGE SETUP ────────────────────────────────────────────────────────────────
@@ -110,7 +134,6 @@ st.set_page_config(
     layout="wide",
 )
 
-# Header
 st.title("Rune")
 st.markdown("_Nigerian fixed income & rates intelligence_")
 snap = latest_snapshot_date()
@@ -123,7 +146,7 @@ else:
     )
     st.stop()
 
-# Sidebar — meta info + manual refresh
+# Sidebar
 with st.sidebar:
     st.header("Database")
     st.write(f"**Path:** `{DB_PATH.name}`")
@@ -143,13 +166,13 @@ with st.sidebar:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 1  —  KPI ROW  (top of page)
+# SECTION 1  —  KPI ROW
 # ══════════════════════════════════════════════════════════════════════════════
 curr = latest_rates()
 prev = prior_rates()
 
+
 def delta_bps(curr_val, prev_val):
-    """Return change in basis points as a string, or None if no prior."""
     if curr_val is None or prev_val is None:
         return None
     bps = (curr_val - prev_val) * 10000
@@ -157,6 +180,7 @@ def delta_bps(curr_val, prev_val):
         return "no change"
     sign = "+" if bps > 0 else ""
     return f"{sign}{bps:.0f} bps"
+
 
 real_91d = (curr.get("NTB_91D") - curr.get("CPI")
             if curr.get("NTB_91D") is not None and curr.get("CPI") is not None else None)
@@ -184,10 +208,10 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 2  —  YIELD CURVE
+# SECTION 2  —  COMBINED YIELD CURVE (overview)
 # ══════════════════════════════════════════════════════════════════════════════
-st.subheader("📈 Sovereign Yield Curve")
-st.caption("Today's stop rates plotted against tenor (years to maturity)")
+st.subheader("📈 Sovereign Yield Curve — Overview")
+st.caption("Today's stop rates plotted across the full curve, 91 days to 30 years")
 
 curve_rows = []
 for instr, rate in curr.items():
@@ -197,7 +221,6 @@ for instr, rate in curr.items():
         curve_rows.append({
             "Tenor (yrs)": TENOR_YEARS[instr],
             "Tenor": TENOR_LABEL.get(instr, instr),
-            "Yield": rate,
             "Yield %": rate * 100,
         })
 
@@ -205,10 +228,6 @@ if curve_rows:
     curve_df = pd.DataFrame(curve_rows).sort_values("Tenor (yrs)").reset_index(drop=True)
     chart_df = curve_df.set_index("Tenor (yrs)")[["Yield %"]]
     st.line_chart(chart_df, height=320)
-
-    display = curve_df[["Tenor", "Yield %"]].copy()
-    display["Yield %"] = display["Yield %"].map(lambda x: f"{x:.2f}%")
-    st.dataframe(display.set_index("Tenor").T, width="stretch")
 else:
     st.info("No tenor data available for the latest snapshot.")
 
@@ -216,7 +235,98 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 3  —  RATE HISTORY
+# SECTION 3  —  NTB YIELD CURVE (segregated)
+# ══════════════════════════════════════════════════════════════════════════════
+st.subheader("🟦 NTB Yield Curve — Treasury Bills")
+st.caption("Stop rates on 91-day, 182-day, and 364-day Nigerian Treasury Bills")
+
+ntb_rows = []
+for instr in NTB_INSTRUMENTS:
+    if instr in curr:
+        ntb_rows.append({
+            "Tenor": TENOR_LABEL[instr],
+            "Tenor (yrs)": TENOR_YEARS[instr],
+            "Yield %": curr[instr] * 100,
+        })
+
+if ntb_rows:
+    ntb_df = pd.DataFrame(ntb_rows).sort_values("Tenor (yrs)").reset_index(drop=True)
+
+    col_chart, col_table = st.columns([2, 1])
+    with col_chart:
+        st.bar_chart(ntb_df.set_index("Tenor")[["Yield %"]], height=280)
+    with col_table:
+        st.markdown("**Latest NTB stops**")
+        display_ntb = ntb_df[["Tenor", "Yield %"]].copy()
+        display_ntb["Yield %"] = display_ntb["Yield %"].map(lambda x: f"{x:.2f}%")
+        render_centered_table(display_ntb)
+else:
+    st.info("No NTB data available for the latest snapshot.")
+
+st.divider()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4  —  FGN BOND YIELD CURVE (segregated)
+# ══════════════════════════════════════════════════════════════════════════════
+st.subheader("🟫 FGN Bond Yield Curve — 2-Year through 30-Year")
+st.caption("Stop rates and traded yields across the FGN sovereign bond curve")
+
+fgn_rows = []
+for instr in FGN_INSTRUMENTS:
+    if instr in curr:
+        fgn_rows.append({
+            "Tenor": TENOR_LABEL[instr],
+            "Tenor (yrs)": TENOR_YEARS[instr],
+            "Yield %": curr[instr] * 100,
+        })
+
+if fgn_rows:
+    fgn_df = pd.DataFrame(fgn_rows).sort_values("Tenor (yrs)").reset_index(drop=True)
+
+    col_chart, col_table = st.columns([2, 1])
+    with col_chart:
+        st.line_chart(fgn_df.set_index("Tenor")[["Yield %"]], height=280)
+    with col_table:
+        st.markdown("**Latest FGN bond yields**")
+        display_fgn = fgn_df[["Tenor", "Yield %"]].copy()
+        display_fgn["Yield %"] = display_fgn["Yield %"].map(lambda x: f"{x:.2f}%")
+        render_centered_table(display_fgn)
+else:
+    st.info("No FGN bond data available for the latest snapshot.")
+
+st.divider()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 5  —  REAL YIELD BY TENOR (yield minus inflation)
+# ══════════════════════════════════════════════════════════════════════════════
+st.subheader("💹 Real Yield by Tenor")
+cpi = curr.get("CPI")
+if cpi is not None:
+    st.caption(f"Nominal yield minus CPI inflation ({cpi*100:.2f}%). Positive = beating inflation. Negative = losing purchasing power.")
+    real_rows = []
+    for instr in NTB_INSTRUMENTS + FGN_INSTRUMENTS:
+        if instr in curr:
+            real_rows.append({
+                "Tenor": TENOR_LABEL[instr],
+                "Tenor (yrs)": TENOR_YEARS[instr],
+                "Real Yield %": (curr[instr] - cpi) * 100,
+            })
+
+    if real_rows:
+        real_df = pd.DataFrame(real_rows).sort_values("Tenor (yrs)").reset_index(drop=True)
+        st.bar_chart(real_df.set_index("Tenor")[["Real Yield %"]], height=280)
+    else:
+        st.info("No tenor data available to compute real yields.")
+else:
+    st.info("CPI inflation rate not available — cannot compute real yields.")
+
+st.divider()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 6  —  RATE HISTORY
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("📊 Rate History")
 st.caption("Pick an instrument to see how its rate has moved over time")
@@ -253,7 +363,7 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 4  —  EUROBONDS
+# SECTION 7  —  EUROBONDS (with chart)
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("🌍 FGN Eurobonds — Latest Snapshot")
 
@@ -268,17 +378,29 @@ if eu_date:
         (eu_date,),
     )
     ust10y = curr.get("USD10Y")
-    if ust10y:
-        eu["Spread vs UST 10Y (bps)"] = ((eu["yield_pct"] - ust10y) * 10000).round(0)
+    if ust10y is not None:
+        eu["Spread_bps"] = ((eu["yield_pct"] - ust10y) * 10000).round(0)
+
+    # Chart: Eurobond yields with UST 10Y reference line baked into label
+    if not eu.empty and ust10y is not None:
+        st.markdown(f"**Eurobond yields vs UST 10Y baseline ({ust10y*100:.2f}%)**")
+        chart_eu = eu[["bond_name", "yield_pct"]].copy()
+        chart_eu["Yield %"] = chart_eu["yield_pct"] * 100
+        # Shorten bond names for readability
+        chart_eu["Bond"] = chart_eu["bond_name"].str.replace(r" \(US\$\)", "", regex=True).str.slice(0, 22)
+        st.bar_chart(chart_eu.set_index("Bond")[["Yield %"]], height=280)
+
+    # Centered table of all Eurobonds
+    st.markdown("**Eurobond detail**")
     eu_display = pd.DataFrame({
-        "Bond":          eu["bond_name"],
+        "Bond":          eu["bond_name"].str.replace(r" \(US\$\)", "", regex=True),
         "Price (US$)":   eu["price"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—"),
         "Yield":         eu["yield_pct"].map(format_pct),
-        "vs UST 10Y":    eu["Spread vs UST 10Y (bps)"].map(
+        "vs UST 10Y":    eu["Spread_bps"].map(
                             lambda x: f"+{int(x)} bps" if pd.notna(x) else "—"
-                         ) if ust10y else "—",
+                         ) if ust10y is not None else "—",
     })
-    st.dataframe(eu_display, width="stretch", hide_index=True)
+    render_centered_table(eu_display)
 else:
     st.info("No Eurobond data in database yet.")
 
@@ -286,7 +408,7 @@ st.divider()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SECTION 5  —  RECENT NTB / FGN AUCTIONS
+# SECTION 8  —  RECENT AUCTIONS (centered)
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("🏛 Recent Auctions — NTBs and FGN Bonds")
 
@@ -311,7 +433,7 @@ if not auct.empty:
         "Stop Rate":        auct["stop_rate"].map(format_pct),
         "Maturity":         auct["maturity_date"],
     })
-    st.dataframe(auct_display, width="stretch", hide_index=True)
+    render_centered_table(auct_display)
 else:
     st.info("No auction records in database yet.")
 
