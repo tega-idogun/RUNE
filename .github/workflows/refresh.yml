@@ -1,45 +1,30 @@
-name: Daily Rune refresh
+name: Daily refresh
 
-# When to run
+# Runs the data refresh automatically so your database stays current
+# even when your MacBook is off. DATABASE_URL comes from the repo secret.
+
 on:
   schedule:
-    # 17:00 UTC = 18:00 (6 pm) Lagos time, weekdays only
-    - cron: '0 17 * * 1-5'
-  # Allow manual triggering from the GitHub Actions tab
-  workflow_dispatch:
-
-# Allow this workflow to write commits back to the repo
-permissions:
-  contents: write
+    # 17:30 UTC, Mon–Fri  (~18:30 West Africa Time, after the day's auctions)
+    - cron: "30 17 * * 1-5"
+  workflow_dispatch: {}   # also lets you run it manually from the Actions tab
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout the repository
+      - name: Check out repo
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests beautifulsoup4 lxml openpyxl
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: Run the refresh script (database only, no workbook)
-        run: python ngx_refresh.py --report --db ngx.db
-
-      - name: Commit updated ngx.db if it changed
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add ngx.db
-          if git diff --staged --quiet; then
-            echo "No database changes to commit."
-          else
-            git commit -m "Auto-refresh: $(date -u +%Y-%m-%d)"
-            git push
-          fi
+      - name: Run refresh (database only)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python ngx_refresh.py --report

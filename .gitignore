@@ -1,18 +1,24 @@
-# macOS junk
-.DS_Store
+# ── Secrets — NEVER commit these ──────────────────────
+.env
+*.env
+.streamlit/secrets.toml
 
-# Python caches and bytecode
-__pycache__/
-*.pyc
-*.pyo
-
-# Excel temp/lockfiles and backups
-~$*.xlsx
+# ── Local database & Excel backups ────────────────────
+ngx.db
+*.sqlite
+*.sqlite3
 *_backup_*.xlsx
 
-# Local-only working file — proprietary, not for GitHub
-NGX_Stock_Screener_Dashboard.xlsx
+# ── Python ────────────────────────────────────────────
+.venv/
+venv/
+__pycache__/
+*.pyc
+.python-version
 
-# Editor / IDE
+# ── macOS ─────────────────────────────────────────────
+.DS_Store
+
+# ── Editors ───────────────────────────────────────────
 .vscode/
 .idea/

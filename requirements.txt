@@ -1,2 +1,13 @@
+# ── App / dashboard ───────────────────────────────────
 streamlit>=1.28
 pandas>=2.0
+
+# ── Database layer (db.py) ────────────────────────────
+SQLAlchemy>=2.0
+psycopg2-binary>=2.9        # Postgres driver (Neon / Supabase / RDS)
+
+# ── Data ingestion (ngx_refresh.py / backfill_cbn_history.py) ──
+requests>=2.31
+beautifulsoup4>=4.12
+lxml>=4.9
+openpyxl>=3.1

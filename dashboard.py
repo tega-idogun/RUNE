@@ -1,35 +1,34 @@
 #!/usr/bin/env python3
 """
-Rune  —  Local Streamlit App
+Rune  —  Streamlit App
 ================================================
 Nigerian fixed income & rates intelligence.
 
-Reads from the ngx.db SQLite file that ngx_refresh.py creates,
-renders a live web dashboard at http://localhost:8501
+Reads from the shared database layer (db.py). In production this is hosted
+Postgres (set DATABASE_URL / Streamlit secret); locally it falls back to a
+SQLite file. The daily refresh (ngx_refresh.py) and the one-time history
+loader (backfill_cbn_history.py) write to the same database.
 
-Setup (one time):
-    pip3 install streamlit
+Setup (local):
+    pip install -r requirements.txt
 
 Run:
-    cd ~/Desktop/NGX_Dashboard
-    python3 -m streamlit run dashboard.py
+    streamlit run dashboard.py
 """
 
-import sqlite3
-from pathlib import Path
-from datetime import datetime, date
+from datetime import datetime
 
 import pandas as pd
 import streamlit as st
 
-# ── CONFIG ────────────────────────────────────────────────────────────────────
-DB_PATH = Path(__file__).resolve().parent / "ngx.db"
+import db
 
+# ── CONFIG ────────────────────────────────────────────────────────────────────
 TENOR_YEARS = {
     "NTB_91D":  0.25, "NTB_182D": 0.50, "NTB_364D": 1.00,
     "FGN_2Y":   2,    "FGN_3Y":   3,    "FGN_5Y":   5,
     "FGN_7Y":   7,    "FGN_10Y":  10,   "FGN_15Y":  15,
-    "FGN_20Y":  20,   "FGN_30Y":  30,
+    "FGN_20Y":  20,   "FGN_25Y":  25,   "FGN_30Y":  30,
     "10Y":      10,   "USD10Y":   10,
 }
 
@@ -37,25 +36,19 @@ TENOR_LABEL = {
     "NTB_91D":  "91D",  "NTB_182D": "182D", "NTB_364D": "364D",
     "FGN_2Y":   "2Y",   "FGN_3Y":   "3Y",   "FGN_5Y":   "5Y",
     "FGN_7Y":   "7Y",   "FGN_10Y":  "10Y",  "FGN_15Y":  "15Y",
-    "FGN_20Y":  "20Y",  "FGN_30Y":  "30Y",
+    "FGN_20Y":  "20Y",  "FGN_25Y":  "25Y",  "FGN_30Y":  "30Y",
 }
 
 NTB_INSTRUMENTS = ["NTB_91D", "NTB_182D", "NTB_364D"]
 FGN_INSTRUMENTS = ["FGN_2Y", "FGN_3Y", "FGN_5Y", "FGN_7Y",
-                   "FGN_10Y", "FGN_15Y", "FGN_20Y", "FGN_30Y"]
+                   "FGN_10Y", "FGN_15Y", "FGN_20Y", "FGN_25Y", "FGN_30Y"]
 
 
 # ── DATA HELPERS ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=60)
-def query(sql: str, params: tuple = ()) -> pd.DataFrame:
-    if not DB_PATH.exists():
-        return pd.DataFrame()
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        df = pd.read_sql_query(sql, conn, params=params)
-    finally:
-        conn.close()
-    return df
+def query(sql: str, params: dict | None = None) -> pd.DataFrame:
+    """Run a named-parameter SELECT via the shared engine. Cached for 60s."""
+    return db.read_sql(sql, params or {})
 
 
 def latest_snapshot_date():
@@ -65,22 +58,35 @@ def latest_snapshot_date():
     return df.iloc[0]["d"]
 
 
-def latest_rates() -> dict:
-    d = latest_snapshot_date()
+def rates_for_date(d) -> dict:
     if not d:
         return {}
-    df = query("SELECT instrument, rate FROM rates WHERE snapshot_date = ?", (d,))
+    df = query("SELECT instrument, rate FROM rates WHERE snapshot_date = :d", {"d": d})
+    return dict(zip(df.instrument, df.rate))
+
+
+def latest_curve() -> dict:
+    """Latest available rate for EVERY instrument (each instrument may have a
+    different most-recent date — auction-dated NTB/FGN vs today-dated
+    benchmarks). This builds the current curve correctly across sources."""
+    df = query("""
+        SELECT r.instrument, r.rate
+        FROM rates r
+        JOIN (SELECT instrument, MAX(snapshot_date) AS d
+              FROM rates GROUP BY instrument) m
+          ON r.instrument = m.instrument AND r.snapshot_date = m.d
+    """)
+    if df.empty:
+        return {}
     return dict(zip(df.instrument, df.rate))
 
 
 def prior_rates() -> dict:
-    df = query(
-        "SELECT DISTINCT snapshot_date FROM rates ORDER BY snapshot_date DESC LIMIT 2"
-    )
+    df = query("SELECT DISTINCT snapshot_date FROM rates ORDER BY snapshot_date DESC LIMIT 2")
     if len(df) < 2:
         return {}
     prior_date = df.iloc[1]["snapshot_date"]
-    pdf = query("SELECT instrument, rate FROM rates WHERE snapshot_date = ?", (prior_date,))
+    pdf = query("SELECT instrument, rate FROM rates WHERE snapshot_date = :d", {"d": prior_date})
     return dict(zip(pdf.instrument, pdf.rate))
 
 
@@ -91,8 +97,6 @@ def format_pct(x, decimals=2):
 
 
 def render_centered_table(df: pd.DataFrame, height=None) -> None:
-    """Render a DataFrame using Streamlit's native renderer with all cells centered.
-    Uses pandas Styler — reliable across Streamlit versions, respects dark/light mode."""
     styled = (
         df.style
           .set_properties(**{"text-align": "center"})
@@ -101,7 +105,6 @@ def render_centered_table(df: pd.DataFrame, height=None) -> None:
               {"selector": "td", "props": [("text-align", "center")]},
           ])
     )
-    # Build kwargs conditionally — newer Streamlit rejects height=None
     kwargs = {"width": "stretch", "hide_index": True}
     if height is not None:
         kwargs["height"] = height
@@ -118,14 +121,16 @@ if snap:
     st.caption(f"Latest snapshot: **{snap}** · sources: CBN · DMO · TradingEconomics")
 else:
     st.error(
-        f"No data found in `{DB_PATH}`. "
-        "Run `python3 ngx_refresh.py` first to populate the database."
+        "No data found in the database. "
+        "Run `python backfill_cbn_history.py` to seed history, then "
+        "`python ngx_refresh.py` to keep it current."
     )
     st.stop()
 
 with st.sidebar:
     st.header("Database")
-    st.write(f"**Path:** `{DB_PATH.name}`")
+    backend = "Postgres" if db.is_postgres() else "SQLite (local)"
+    st.write(f"**Backend:** {backend}")
     counts = query("""
         SELECT 'rates' AS tbl, COUNT(*) AS n FROM rates
         UNION ALL SELECT 'auctions', COUNT(*) FROM auctions
@@ -138,13 +143,13 @@ with st.sidebar:
         st.rerun()
     st.divider()
     st.caption("Refresh the underlying data by running:")
-    st.code("python3 ngx_refresh.py", language="bash")
+    st.code("python ngx_refresh.py", language="bash")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SECTION 1  —  KPI ROW
 # ══════════════════════════════════════════════════════════════════════════════
-curr = latest_rates()
+curr = latest_curve()
 prev = prior_rates()
 
 
@@ -187,7 +192,7 @@ st.divider()
 # SECTION 2  —  COMBINED YIELD CURVE
 # ══════════════════════════════════════════════════════════════════════════════
 st.subheader("📈 Sovereign Yield Curve — Overview")
-st.caption("Today's stop rates plotted across the full curve, 91 days to 30 years")
+st.caption("Latest stop rates plotted across the full curve, 91 days to 30 years")
 
 curve_rows = []
 for instr, rate in curr.items():
@@ -227,7 +232,6 @@ for instr in NTB_INSTRUMENTS:
 
 if ntb_rows:
     ntb_df = pd.DataFrame(ntb_rows).sort_values("Tenor (yrs)").reset_index(drop=True)
-
     col_chart, col_table = st.columns([2, 1])
     with col_chart:
         st.bar_chart(ntb_df.set_index("Tenor")[["Yield %"]], height=280)
@@ -259,7 +263,6 @@ for instr in FGN_INSTRUMENTS:
 
 if fgn_rows:
     fgn_df = pd.DataFrame(fgn_rows).sort_values("Tenor (yrs)").reset_index(drop=True)
-
     col_chart, col_table = st.columns([2, 1])
     with col_chart:
         st.line_chart(fgn_df.set_index("Tenor")[["Yield %"]], height=280)
@@ -321,8 +324,8 @@ else:
     pick = st.selectbox("Instrument", all_instruments, index=default_idx)
 
     hist = query(
-        "SELECT snapshot_date, rate FROM rates WHERE instrument = ? ORDER BY snapshot_date",
-        (pick,),
+        "SELECT snapshot_date, rate FROM rates WHERE instrument = :i ORDER BY snapshot_date",
+        {"i": pick},
     )
 
     if len(hist) >= 2:
@@ -332,8 +335,7 @@ else:
     elif len(hist) == 1:
         st.info(
             f"Only **one** data point so far for {pick}: "
-            f"{hist.iloc[0]['rate']*100:.2f}% on {hist.iloc[0]['snapshot_date']}. "
-            "Run ngx_refresh.py for a few more days to build a trend."
+            f"{hist.iloc[0]['rate']*100:.2f}% on {hist.iloc[0]['snapshot_date']}."
         )
     else:
         st.info(f"No history found for {pick}.")
@@ -352,12 +354,12 @@ eu_date = eu_date_row.iloc[0]["d"] if not eu_date_row.empty else None
 if eu_date:
     st.caption(f"Data as of: **{eu_date}** (DMO daily Excel)")
     eu = query(
-        "SELECT bond_name, price, yield_pct FROM eurobonds WHERE snapshot_date = ? "
+        "SELECT bond_name, price, yield_pct FROM eurobonds WHERE snapshot_date = :d "
         "ORDER BY bond_name",
-        (eu_date,),
+        {"d": eu_date},
     )
     ust10y = curr.get("USD10Y")
-    if ust10y is not None:
+    if ust10y is not None and not eu.empty:
         eu["Spread_bps"] = ((eu["yield_pct"] - ust10y) * 10000).round(0)
 
     if not eu.empty and ust10y is not None:
@@ -367,16 +369,17 @@ if eu_date:
         chart_eu["Bond"] = chart_eu["bond_name"].str.replace(r" \(US\$\)", "", regex=True).str.slice(0, 22)
         st.bar_chart(chart_eu.set_index("Bond")[["Yield %"]], height=280)
 
-    st.markdown("**Eurobond detail**")
-    eu_display = pd.DataFrame({
-        "Bond":          eu["bond_name"].str.replace(r" \(US\$\)", "", regex=True),
-        "Price (US$)":   eu["price"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—"),
-        "Yield":         eu["yield_pct"].map(format_pct),
-        "vs UST 10Y":    eu["Spread_bps"].map(
-                            lambda x: f"+{int(x)} bps" if pd.notna(x) else "—"
-                         ) if ust10y is not None else "—",
-    })
-    render_centered_table(eu_display)
+    if not eu.empty:
+        st.markdown("**Eurobond detail**")
+        eu_display = pd.DataFrame({
+            "Bond":          eu["bond_name"].str.replace(r" \(US\$\)", "", regex=True),
+            "Price (US$)":   eu["price"].map(lambda x: f"{x:.3f}" if pd.notna(x) else "—"),
+            "Yield":         eu["yield_pct"].map(format_pct),
+            "vs UST 10Y":    eu["Spread_bps"].map(
+                                lambda x: f"+{int(x)} bps" if pd.notna(x) else "—"
+                             ) if ust10y is not None else "—",
+        })
+        render_centered_table(eu_display)
 else:
     st.info("No Eurobond data in database yet.")
 
