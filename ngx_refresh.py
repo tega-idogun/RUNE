@@ -7,13 +7,18 @@ AND persists a daily snapshot to the database (via db.py) so you build a
 time-series history of every fetch.
 
 CHANGED (migration):
-  • Persistence now goes through db.py, which targets Postgres in production
-    (set DATABASE_URL) and falls back to local SQLite for offline dev. This
-    replaces the old hard-coded local ngx.db — that file was being wiped on
-    every Streamlit Cloud redeploy, which is why history never accumulated.
-  • NTB/FGN rate snapshots are now keyed by their AUCTION date (not "today"),
-    so daily runs extend the exact same series that backfill_cbn_history.py
-    seeds — no duplicate today-stamped points.
+  • Persistence now goes through db.py (Postgres in prod via DATABASE_URL,
+    SQLite fallback for offline dev).
+  • NTB/FGN rate snapshots are keyed by AUCTION date so daily runs extend the
+    same series that backfill_cbn_history.py seeds.
+
+CHANGED (data quality + alerting):
+  • Rows are validated before they are written. Auctions with a maturity on or
+    before the auction date (or, for NTBs, a maturity gap that doesn't match the
+    bill tenor) are skipped and logged. Implausible rates are skipped.
+  • If a CRITICAL source fails, the script exits non-zero so the scheduled
+    GitHub Actions run is flagged red and emails you, instead of failing
+    silently. Use --no-fail to suppress that (e.g. for ad-hoc local runs).
 
 CONFIRMED DATA SOURCES:
   ✅  CBN JSON API        cbn.gov.ng/api/GetAllSecuritiesNTB      (NTB records)
@@ -29,9 +34,8 @@ NOT AVAILABLE (paid subscription required):
 Usage:
     export DATABASE_URL="postgresql+psycopg2://USER:PASS@HOST/DB?sslmode=require"
     python ngx_refresh.py                       # update workbook + DB
-    python ngx_refresh.py --backup              # backup workbook before updating
     python ngx_refresh.py --report              # no workbook writes (DB still updates)
-    python ngx_refresh.py --workbook /path/to/file.xlsx
+    python ngx_refresh.py --no-fail             # never exit non-zero on source failure
     python ngx_refresh.py --no-db               # skip database write
 """
 
@@ -99,16 +103,8 @@ def get(url):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# PERSISTENCE  —  now via db.py (Postgres in prod, SQLite fallback)
+# PERSISTENCE  —  via db.py (Postgres in prod, SQLite fallback)
 # ══════════════════════════════════════════════════════════════════════════════
-#
-# Three tables (defined in db.py), all upserted on their primary key so
-# re-running the same day overwrites the same row instead of duplicating:
-#
-#   rates      one row per (snapshot_date, instrument)
-#   auctions   one row per (auction_date, security_type, tenor)
-#   eurobonds  one row per (snapshot_date, bond_name)
-#
 def _iso(s):
     """Convert 'dd/mm/yyyy' string to 'YYYY-MM-DD'. Returns None on failure."""
     try:
@@ -117,46 +113,120 @@ def _iso(s):
         return None
 
 
+# ── Data-quality validation ─────────────────────────────────────────────────
+NTB_TENOR_DAYS = {"91D": 91, "182D": 182, "364D": 364}
+
+
+def _sane_rate(x):
+    """A plausible decimal rate: 0 < x <= 2.0 (i.e. up to 200%)."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return False
+    return 0 < x <= 2.0
+
+
+def _validate_auction(ad_iso, md_iso, sec_type, tenor):
+    """(ok, reason). Rejects maturity-on-or-before-issue and implausible spans.
+    For NTBs the maturity gap must match the bill tenor; FGN bonds are often
+    re-openings, so their gap legitimately differs from the tenor label."""
+    if not ad_iso:
+        return False, "unparseable auction date"
+    if not md_iso:
+        return True, ""                       # keep; maturity simply unknown
+    try:
+        a = datetime.date.fromisoformat(ad_iso)
+        m = datetime.date.fromisoformat(md_iso)
+    except Exception:
+        return False, "unparseable date"
+    if m <= a:
+        return False, f"maturity {md_iso} not after auction {ad_iso}"
+    gap = (m - a).days
+    if gap > 366 * 50:
+        return False, f"implausible {gap}-day maturity"
+    if sec_type == "NTB":
+        expected = NTB_TENOR_DAYS.get(tenor)
+        if expected and abs(gap - expected) > 25:
+            return False, f"{tenor} bill but {gap}-day maturity gap"
+    return True, ""
+
+
+def _source_health(problems, warnings, no_fail):
+    """Print a source-health summary. Exit non-zero on any critical problem so
+    the scheduled run is flagged red (GitHub emails you) instead of failing
+    silently."""
+    section("SOURCE HEALTH")
+    for w in warnings:
+        log(w, "WARN")
+    if problems:
+        for p in problems:
+            log(p, "ERR")
+        if no_fail:
+            log("Critical source(s) failed (continuing: --no-fail set).", "WARN")
+        else:
+            log("Critical source(s) failed — exiting non-zero to flag this run.", "ERR")
+            sys.exit(1)
+    else:
+        log("All critical sources OK", "OK")
+
+
 def _rate_rows(ntb, fgn_bonds, bench, now):
-    """Build rows for the rates table.
+    """Build rows for the rates table, skipping implausible values.
 
     NTB/FGN points are stamped with their AUCTION date so they extend the same
     series produced by the history backfill. Benchmarks (MPR/CPI/10Y/USD10Y)
     have no auction date, so they're stamped with today's date.
     """
     today = datetime.date.today().isoformat()
-    rows = []
+    rows, skipped = [], 0
+
+    def add(instr, rate, date_iso, src):
+        nonlocal skipped
+        if not _sane_rate(rate):
+            log(f"  skipped {instr}: implausible rate {rate}", "WARN")
+            skipped += 1
+            return
+        rows.append(dict(snapshot_date=date_iso, instrument=instr,
+                         rate=float(rate), source=src, fetched_at=now))
+
     for tenor, rec in ntb.items():
-        d = _iso(rec.get("auction_date", "")) or today
-        rows.append(dict(snapshot_date=d, instrument=f"NTB_{tenor}",
-                         rate=float(rec["rate"]), source="CBN", fetched_at=now))
+        add(f"NTB_{tenor}", rec.get("rate"), _iso(rec.get("auction_date", "")) or today, "CBN")
     for tenor, rec in fgn_bonds.items():
-        d = _iso(rec.get("auction_date", "")) or today
-        rows.append(dict(snapshot_date=d, instrument=f"FGN_{tenor}",
-                         rate=float(rec["rate"]), source="CBN", fetched_at=now))
+        add(f"FGN_{tenor}", rec.get("rate"), _iso(rec.get("auction_date", "")) or today, "CBN")
     for key, val in bench.items():
         if val is not None:
-            rows.append(dict(snapshot_date=today, instrument=key,
-                             rate=float(val), source="TE", fetched_at=now))
+            add(key, val, today, "TE")
+
+    if skipped:
+        log(f"  {skipped} rate row(s) failed sanity checks and were skipped", "WARN")
     return rows
 
 
 def _auction_rows(ntb, fgn_bonds, now):
-    rows = []
+    """Build auction rows, skipping any that fail integrity validation."""
+    rows, skipped = [], 0
+
+    def add(sec, tenor, rec):
+        nonlocal skipped
+        ad = _iso(rec.get("auction_date", ""))
+        md = _iso(rec.get("maturity", ""))
+        ok, reason = _validate_auction(ad, md, sec, tenor)
+        if not ok:
+            log(f"  skipped {sec} {tenor} auction: {reason}", "WARN")
+            skipped += 1
+            return
+        rows.append(dict(auction_date=ad, security_type=sec, tenor=tenor,
+                         offered=rec.get("offered"), subscribed=rec.get("subscribed"),
+                         allotted=rec.get("allotted"), stop_rate=rec.get("rate"),
+                         maturity_date=md, fetched_at=now))
+
     for tenor, rec in ntb.items():
-        ad = _iso(rec.get("auction_date", ""))
-        if ad:
-            rows.append(dict(auction_date=ad, security_type="NTB", tenor=tenor,
-                             offered=rec.get("offered"), subscribed=rec.get("subscribed"),
-                             allotted=rec.get("allotted"), stop_rate=rec.get("rate"),
-                             maturity_date=_iso(rec.get("maturity", "")), fetched_at=now))
+        add("NTB", tenor, rec)
     for tenor, rec in fgn_bonds.items():
-        ad = _iso(rec.get("auction_date", ""))
-        if ad:
-            rows.append(dict(auction_date=ad, security_type="FGN", tenor=tenor,
-                             offered=rec.get("offered"), subscribed=rec.get("subscribed"),
-                             allotted=rec.get("allotted"), stop_rate=rec.get("rate"),
-                             maturity_date=_iso(rec.get("maturity", "")), fetched_at=now))
+        add("FGN", tenor, rec)
+
+    if skipped:
+        log(f"  {skipped} auction row(s) failed validation and were skipped", "WARN")
     return rows
 
 
@@ -630,6 +700,8 @@ def main():
     ap.add_argument("--report",   action="store_true", help="Skip workbook update (DB still persists)")
     ap.add_argument("--workbook", default=WORKBOOK_PATH)
     ap.add_argument("--no-db",    action="store_true", help="Skip database write")
+    ap.add_argument("--no-fail",  action="store_true",
+                    help="Do not exit non-zero even if a critical source failed")
     args = ap.parse_args()
 
     print(f"\n{'═'*62}")
@@ -665,18 +737,32 @@ def main():
         det  = f"  →  {detail}" if detail else ""
         print(f"    {icon}  {label:28}{det}")
 
+    # SOURCE HEALTH — decide what counts as a broken run
+    problems, warnings = [], []
+    if not ntb:
+        problems.append("CBN NTB feed returned no usable data")
+    if not any(bench.get(k) for k in ("MPR", "CPI", "10Y")):
+        problems.append("All TradingEconomics benchmarks (MPR/CPI/10Y) failed")
+    if not fgn_bonds:
+        warnings.append("CBN FGN bond feed returned no data")
+    if not eu:
+        warnings.append("DMO Eurobond data unavailable this run")
+
     # PERSIST (before workbook write — so DB updates even in --report mode)
     if not args.no_db:
         persist_to_db(ntb, fgn_bonds, bench, eu)
 
     if args.report:
         print("\n  Report-only mode — no workbook changes written.")
+        _source_health(problems, warnings, args.no_fail)
         return
 
     # LOAD & UPDATE WORKBOOK
     section("UPDATING WORKBOOK")
     if not Path(args.workbook).exists():
-        log(f"File not found: {args.workbook}", "ERR"); sys.exit(1)
+        log(f"File not found: {args.workbook}", "ERR")
+        _source_health(problems, warnings, args.no_fail)
+        sys.exit(1)
 
     if args.backup:
         bk = args.workbook.replace(".xlsx",
@@ -705,6 +791,10 @@ def main():
   Eurobond data date:  {eu.get('date') if eu else 'N/A'}
   Database:            {db.database_url().split('@')[-1]}
 """)
+
+    # SOURCE HEALTH (always last — may exit non-zero)
+    _source_health(problems, warnings, args.no_fail)
+
 
 if __name__ == "__main__":
     main()
